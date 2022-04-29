@@ -1,0 +1,175 @@
+<#=============================================================================================================================
+.COPYRIGHT
+Copyright (c) Microsoft Corporation. All rights reserved, licensed under the MIT license.
+See LICENSE in the project root for license information.
+
+
+Script Name:      Intune_iOS_BulkRetire.ps1
+Updated Date:     04/26/2022
+Author:           Saad Fazal
+Version:          1.0
+Description:      Script will retire iOS devices for the serial number provided as a CSV Input.
+
+Required Modules:
+#Install-PackageProvider -Name NuGet -MinimumVersion 2.8.5.201 -Force
+Install-Module AzureAD -Force
+Install-Module WindowsAutopilotIntune -Force
+Install-Module Microsoft.Graph.Intune -Force
+Connect-MSGraph (This is to connect PowerShell to MSGraph service)
+
+
+For Latest Verion of Powershell, You may need to run with -UseWindowsPowerShell swicth
+For example,
+Import-Module -Name  "Microsoft.Graph.Intune" -UseWindowsPowerShell
+Import-Module -Name  "WindowsAutoPilotIntune" -UseWindowsPowerShell
+Import-Module AzureAD -UseWindowsPowerShell
+
+Readme:-
+Connect-MSGraph
+#Global admin or Intune admin is required
+Provide a path to the CSV
+
+CSV header (First Line): 
+SerialNumber
+One Serial Number Per Line
+One Serial Number Per Line
+One Serial Number Per Line
+
+
+Connect-Azure
+#Global admin or Intune admin is required
+=============================================================================================================================#>
+
+# Turn on Transcript logging
+Start-Transcript -Path C:\Intune\logs\MAD_Intune_iOS_BulkRetire.log
+
+# Define variable to store list of available module and required module
+Write-Host "Checking for Intune & AzureAD modules..." -ForegroundColor Yellow
+$Module = Get-Module -ListAvailable -name "AzureAD" , "AzureADPreview" , "Microsoft.Graph.Intune" , "WindowsAutoPilotIntune"
+$ModulesNeeded = "AzureAD" , "Microsoft.Graph.Intune" , "WindowsAutoPilotIntune"
+
+foreach($M in $ModulesNeeded)
+{
+
+    if($Module.Name -contains $M) {
+        Write-Host $M "Required Module found" -ForegroundColor Green
+    }
+
+    else {
+
+        Write-Host $M " Module not found, please check the pre-requisite document" -ForegroundColor Red
+        write-host "Script can't continue..." -f Red
+        write-host
+        exit
+    }
+}
+# Connecting to MsGraph
+Write-Host "Connecting to Intune MSGraph..." -ForegroundColor Yellow
+Connect-MSGraph
+
+#Get All iOS devices with serial number
+Write-Host "Script is gathering all the iOS Devices & Serial Numbers ..." -ForegroundColor Yellow
+try{
+
+$iOSDevices = get-intunemanageddevice -Filter "OperatingSystem eq 'iOS'"| Get-MSGraphAllPages | Select-Object id,deviceName,complianceState,managedDeviceOwnerType,azureADDeviceId,SerialNumber
+}
+catch {
+    $message = $_
+    Write-Warning "Please verify if powershell is authenticated with Connect-MSGraph ! It seems like PS is $message" -ErrorAction stop
+    break
+}
+
+Start-Sleep -Seconds 5
+
+#Define variable to store data
+
+$deviceState = $iOSDevices.managedDeviceOwnerType
+$deviceid = $iOSDevices.id
+$deviceComplaint = $iOSDevices.complianceState
+$deviceName = $iOSDevices.deviceName
+$deviceAzureID = $iOSDevices.azureADDeviceId
+
+# Define CSV file path for an input 
+$Path = Read-Host "Please enter the CSV Path of iOS devices containing serial numbers For Eg (C:\iOS_Devices.CSV)"
+
+# arrys for storing multiple results
+$aadObjIDContainers = @()
+$Pass = @()
+$Fail = @()
+
+# If file path exists
+Try {
+    $File = (Import-Csv -Path $Path)
+}
+Catch {
+    Write-Host $Path "File or Path does not exist" -ForegroundColor Red
+    Exit
+}
+# checking if the iOS devices mentioned in the CSV exist in Intune
+foreach($DeviceCheck in $File)
+{
+    if ($iOSDevices.SerialNumber -contains $DeviceCheck.SerialNumber)
+    {
+    Write-Host $DeviceCheck.SerialNumber "Found in Intune - Ready to Retire" -ForegroundColor Green
+    Write-Host "Script will start retiring devices provided via CSV file, Waiting for 5 seconds..." -ForegroundColor Green
+    Start-Sleep -Seconds 5
+
+# Retiring Intune iOS devices provided via CSV
+        foreach($Retire in $iOSDevices)
+        {
+            if ($Retire.SerialNumber -contains $DeviceCheck.SerialNumber)
+            {
+                Invoke-IntuneManagedDeviceRetire -managedDeviceId $Retire.id -Verbose
+                Write-Host $DeviceCheck.SerialNumber "is being retired ..." -ForegroundColor Yellow
+
+# Storing AzureAD Device ID for deleting Azure AD object
+                $aadObjIDContainers += $Retire.azureADDeviceId
+
+# Generating log file for successful retired devices
+				 $Pass += $Retire.SerialNumber | Out-File c:\temp\PassiOSRetire.txt -Append
+            }
+        }
+    }
+    else
+    {
+        Write-Host $DeviceCheck.SerialNumber "not found in Intune -Please check the CSV you provided" -ForegroundColor Red
+		$Fail += $DeviceCheck.SerialNumber | Out-File c:\temp\failiOSRetire.txt -Append
+    }
+}
+
+
+# deleting AzureAD object
+# Halt the process for 5 sec to connect to a different source (Azure ActiveDirectory)
+Write-Host "Please wait for 30 seconds for devices to be fully retired from Intune..." -ForegroundColor Yellow
+Start-Sleep -Seconds 30
+Write-Host "Connecting to Azure AD now..." -ForegroundColor Yellow
+
+
+
+# Connecting to Azure AD now
+Connect-AzureAD
+
+# Get Azure AD Device Object ID from Azure Device ID
+foreach($aadObjIDContainer in $aadObjIDContainers)
+{
+
+# comparing Azure Ad object id with the CSV provided serial number devices
+$GetObjID = Get-AzureADDevice | Where-Object {$_.DeviceId -eq "$aadObjIDContainer"} | Select-Object ObjectId
+
+        foreach($ObjDel in $GetObjID.ObjectId)
+        {
+             try{
+                Remove-AzureADDevice -ObjectId $ObjDel
+                Write-Host "Azure Object ID" $ObjDel "is removed" -ForegroundColor Green
+                }
+                catch
+                {
+                Write-Host  "Azure Object Id" $ObjDel "is not being removed" -ForegroundColor Red
+                }
+
+       }
+  }
+
+   
+# Turn off Transcript logging
+Stop-Transcript   
